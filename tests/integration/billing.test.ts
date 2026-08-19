@@ -161,4 +161,43 @@ describe('billing run', () => {
     expect(gateway.charges).toHaveLength(1);
     expect((await harness.bundle(bundleId)).status).toBe('ACTIVE');
   });
+
+  it('snapshots usage when the period was closed by a database-generated timestamp', async () => {
+    // These timestamps come from the database rather than the application
+    // clock. Before the columns were pinned to millisecond precision they
+    // carried microseconds, which a JS Date silently truncated - so the usage
+    // snapshot matched no row and the closing balance was lost.
+    const live = await Harness.start({ config: CONFIG });
+    try {
+      const userId = await live.createUser();
+      const rows = await live.container.database.query<{ id: string }>(
+        `INSERT INTO subscription_bundles
+           (user_id, tier, billing_cycle, status, max_messages, used_messages,
+            price_cents, auto_renew, start_date, end_date, renewal_date)
+         VALUES ($1, 'BASIC', 'MONTHLY', 'ACTIVE', 10, 4, 900, TRUE,
+                 now() - interval '30 days', now() - interval '1 minute', now() - interval '1 minute')
+         RETURNING id`,
+        [userId],
+      );
+      const bundleId = rows[0]?.id;
+      if (!bundleId) throw new Error('failed to insert the bundle');
+
+      await live.container.database.query(
+        `INSERT INTO subscription_billing_periods
+           (bundle_id, period_start, period_end, price_cents, status, settled_at)
+         SELECT id, start_date, end_date, price_cents, 'PAID', now()
+           FROM subscription_bundles WHERE id = $1`,
+        [bundleId],
+      );
+
+      const report = await live.container.billing.run();
+
+      expect(report.renewed).toContain(bundleId);
+      expect(await live.bundleUsage(bundleId)).toBe(0);
+      // The closing period kept what was spent in it.
+      expect((await live.billingPeriods(bundleId))[0]?.messages_used).toBe(4);
+    } finally {
+      await live.stop();
+    }
+  });
 });

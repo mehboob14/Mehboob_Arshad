@@ -3,7 +3,7 @@
 A metered AI chat API funded by subscription bundles.
 TypeScript · Express 5 · PostgreSQL · Clean Architecture (DDD-style)
 
-**Status:** both modules complete. 61 tests passing (32 unit, 29 integration). Lint and
+**Status:** both modules complete. 62 tests passing (32 unit, 30 integration). Lint and
 `tsc --noEmit` clean. Verified end to end against PostgreSQL 17.
 
 ---
@@ -44,7 +44,7 @@ docker compose up -d
 ```
 
 ```bash
-npm test          # 61 tests (integration needs the database)
+npm test          # 62 tests (integration needs the database)
 npm run lint
 npm run typecheck
 ```
@@ -255,6 +255,12 @@ and every controller is unit-testable without a server.
 **Migrations are append-only.** `005_billing.sql` alters constraints that `002` created rather
 than editing `002`, because an applied migration is history: rewriting it silently diverges every
 database that already ran it.
+
+**Timestamps are millisecond-precision by column type.** PostgreSQL stores `timestamptz` to
+microseconds; a JavaScript `Date` carries milliseconds. A value the database generated therefore
+lost its last three digits on the way into the application, and any query matching a row by
+timestamp equality silently found nothing. `006_timestamp_precision.sql` pins every timestamp
+column to `timestamptz(3)`, so the two sides agree by construction instead of by luck.
 
 **Everything ambient is injected.** Time (`Clock`), randomness (`SimulatedPaymentGateway`'s
 `random`), the AI provider and the payment gateway all arrive through the constructor. That is
@@ -582,30 +588,31 @@ exactly where each one would attach.
 
 ## Tests
 
-61 tests: 32 unit, 29 integration. Not coverage for its own sake — one test per rule the brief
+62 tests: 32 unit, 30 integration. Not coverage for its own sake — one test per rule the brief
 states, plus the races that break metering and billing systems in production.
 
 Unit tests are pure: policy, state machine and date arithmetic, no database. Integration tests run
 against real PostgreSQL over real HTTP, because a concurrency guarantee that is only proven against
 a mock is not proven.
 
-| Test                                    | What breaks if it fails                              |
-| --------------------------------------- | ---------------------------------------------------- |
-| 8 concurrent requests, 1 credit         | Users consume more than they paid for                |
-| 8 concurrent requests, 1 free message   | Same, on the free path                               |
-| Duplicate `Idempotency-Key`             | Users are charged twice for one retry                |
-| Simultaneous duplicate keys             | The double-click case, in flight                     |
-| Same key, different body                | Silent key reuse corrupts the record                 |
-| Keys reused across two users            | One tenant can observe or block another              |
-| AI provider failure                     | Users pay for answers they never got                 |
-| Month rollover with a fixed clock       | The free grant never resets, or resets wrongly       |
-| Bundle selection order                  | The wrong balance is drained; credit expires unused  |
-| Unlimited held in reserve               | Perishable prepaid credit is wasted                  |
-| Repeated billing run                    | Subscribers are charged twice for one period         |
-| Concurrent billing runs                 | Same, under a race                                   |
-| Declined renewal                        | An unpaid subscription keeps serving                 |
-| Gateway timeout during renewal          | An unknown charge is retried and duplicated          |
-| Cancel, then run billing past `endDate` | Cancellation deletes history, or service stops early |
-| Duplicate purchase key                  | A user is billed twice for one bundle                |
-| Another user's subscription id          | Cross-tenant data exposure                           |
-| Month-end and leap-day renewal dates    | Every subsequent renewal date drifts                 |
+| Test                                            | What breaks if it fails                              |
+| ----------------------------------------------- | ---------------------------------------------------- |
+| 8 concurrent requests, 1 credit                 | Users consume more than they paid for                |
+| 8 concurrent requests, 1 free message           | Same, on the free path                               |
+| Duplicate `Idempotency-Key`                     | Users are charged twice for one retry                |
+| Simultaneous duplicate keys                     | The double-click case, in flight                     |
+| Same key, different body                        | Silent key reuse corrupts the record                 |
+| Keys reused across two users                    | One tenant can observe or block another              |
+| AI provider failure                             | Users pay for answers they never got                 |
+| Month rollover with a fixed clock               | The free grant never resets, or resets wrongly       |
+| Bundle selection order                          | The wrong balance is drained; credit expires unused  |
+| Unlimited held in reserve                       | Perishable prepaid credit is wasted                  |
+| Repeated billing run                            | Subscribers are charged twice for one period         |
+| Concurrent billing runs                         | Same, under a race                                   |
+| Declined renewal                                | An unpaid subscription keeps serving                 |
+| Gateway timeout during renewal                  | An unknown charge is retried and duplicated          |
+| Cancel, then run billing past `endDate`         | Cancellation deletes history, or service stops early |
+| Duplicate purchase key                          | A user is billed twice for one bundle                |
+| Another user's subscription id                  | Cross-tenant data exposure                           |
+| Month-end and leap-day renewal dates            | Every subsequent renewal date drifts                 |
+| Period closed by a database-generated timestamp | Usage history is silently lost on renewal            |
