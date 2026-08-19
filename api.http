@@ -1,0 +1,98 @@
+@baseUrl = http://localhost:3000
+@free = 11111111-1111-1111-1111-111111111111
+@basic = 22222222-2222-2222-2222-222222222222
+@stacked = 33333333-3333-3333-3333-333333333333
+@enterprise = 44444444-4444-4444-4444-444444444444
+
+### Health
+GET {{baseUrl}}/health
+
+### Current allowances
+GET {{baseUrl}}/api/v1/usage
+X-User-Id: {{free}}
+
+### Ask a question - paid for by the free monthly grant
+POST {{baseUrl}}/api/v1/chat/messages
+Content-Type: application/json
+X-User-Id: {{free}}
+
+{ "question": "Explain database row locking in one paragraph." }
+
+### Send the same request four times - the fourth exceeds the free grant (402)
+POST {{baseUrl}}/api/v1/chat/messages
+Content-Type: application/json
+X-User-Id: {{free}}
+
+{ "question": "Another question." }
+
+### Idempotent submission - run this twice, the second is a replay, not a charge
+POST {{baseUrl}}/api/v1/chat/messages
+Content-Type: application/json
+X-User-Id: {{basic}}
+Idempotency-Key: demo-key-001
+
+{ "question": "What happens if the client retries?" }
+
+### Same key, different body - rejected as key reuse (422)
+POST {{baseUrl}}/api/v1/chat/messages
+Content-Type: application/json
+X-User-Id: {{basic}}
+Idempotency-Key: demo-key-001
+
+{ "question": "A completely different question." }
+
+### Bundle selection - this user holds Basic and Pro; Pro has more left, so Pro pays
+POST {{baseUrl}}/api/v1/chat/messages
+Content-Type: application/json
+X-User-Id: {{stacked}}
+
+{ "question": "Which bundle paid for this?" }
+
+### Message history
+GET {{baseUrl}}/api/v1/chat/messages?limit=10
+X-User-Id: {{stacked}}
+
+###############################################################################
+# Module 2 - subscription bundles
+###############################################################################
+
+### Buy a bundle. PAYMENT_FAILURE_RATE decides whether the mocked charge is declined.
+POST {{baseUrl}}/api/v1/subscriptions
+Content-Type: application/json
+X-User-Id: {{free}}
+Idempotency-Key: purchase-001
+
+{ "tier": "PRO", "billingCycle": "MONTHLY", "autoRenew": true }
+
+### Replay the purchase - same key, same response, no second charge
+POST {{baseUrl}}/api/v1/subscriptions
+Content-Type: application/json
+X-User-Id: {{free}}
+Idempotency-Key: purchase-001
+
+{ "tier": "PRO", "billingCycle": "MONTHLY", "autoRenew": true }
+
+### List the caller's subscriptions
+GET {{baseUrl}}/api/v1/subscriptions
+X-User-Id: {{free}}
+
+### One subscription, with its billing periods - this is the usage history
+GET {{baseUrl}}/api/v1/subscriptions/REPLACE_WITH_SUBSCRIPTION_ID
+X-User-Id: {{free}}
+
+### Toggle auto-renew
+PATCH {{baseUrl}}/api/v1/subscriptions/REPLACE_WITH_SUBSCRIPTION_ID
+Content-Type: application/json
+X-User-Id: {{free}}
+
+{ "autoRenew": false }
+
+### Cancel - stops renewal, keeps serving until endDate, keeps history
+POST {{baseUrl}}/api/v1/subscriptions/REPLACE_WITH_SUBSCRIPTION_ID/cancel
+X-User-Id: {{free}}
+
+### Run the billing cycle (stands in for the scheduler; safe to call repeatedly)
+POST {{baseUrl}}/api/v1/billing/run
+Content-Type: application/json
+
+{ "limit": 100 }
