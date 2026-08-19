@@ -170,6 +170,21 @@ export class Harness {
     };
   }
 
+  /** Sends a body the JSON parser will reject, or one over the size limit. */
+  async postRaw(path: string, userId: string, body: string): Promise<ApiResponse> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-user-id': userId },
+      body,
+    });
+    const text = await response.text();
+    return {
+      status: response.status,
+      headers: response.headers,
+      body: text ? (JSON.parse(text) as Record<string, unknown>) : {},
+    };
+  }
+
   async bundle(bundleId: string): Promise<{
     status: string;
     used_messages: number;

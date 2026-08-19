@@ -1,4 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type {
+  PaymentGateway,
+  PaymentRequest,
+  PaymentResult,
+} from '../../src/modules/subscriptions/domain/payment.js';
+import type { SubscriptionRepository } from '../../src/modules/subscriptions/domain/ports.js';
+import { PostgresBillingPeriodRepository } from '../../src/modules/subscriptions/repositories/billing-period.repository.postgres.js';
+import { PostgresSubscriptionRepository } from '../../src/modules/subscriptions/repositories/subscription.repository.postgres.js';
+import { BillingService } from '../../src/modules/subscriptions/services/billing.service.js';
 import { FixedClock } from '../../src/shared/domain/clock.js';
 import { Harness, RecordingGateway } from './harness.js';
 
@@ -8,6 +17,18 @@ const AFTER_PERIOD = new Date('2026-09-19T10:00:01Z');
 
 // No free messages, so every message provably comes out of the bundle.
 const CONFIG = { AI_LATENCY_MIN_MS: 0, AI_LATENCY_MAX_MS: 0, FREE_MESSAGES_PER_MONTH: 0 };
+
+/** Succeeds, but lets the test mutate the subscription while the charge is in flight. */
+class InterferingGateway implements PaymentGateway {
+  readonly charges: PaymentRequest[] = [];
+  duringCharge: () => Promise<void> = () => Promise.resolve();
+
+  async charge(request: PaymentRequest): Promise<PaymentResult> {
+    this.charges.push(request);
+    await this.duringCharge();
+    return { outcome: 'SUCCEEDED', reference: request.reference };
+  }
+}
 
 interface RunReport {
   renewed: string[];
@@ -196,6 +217,118 @@ describe('billing run', () => {
       expect(await live.bundleUsage(bundleId)).toBe(0);
       // The closing period kept what was spent in it.
       expect((await live.billingPeriods(bundleId))[0]?.messages_used).toBe(4);
+    } finally {
+      await live.stop();
+    }
+  });
+
+  it('reports a charge for a period the subscription has since left', async () => {
+    // The subscription is closed while the charge is in flight. The money moved,
+    // so it must be recorded and surfaced - previously the guard returned early,
+    // leaving the period PENDING with no reference, reachable by no recovery
+    // path, and absent from every report.
+    const gateway = new InterferingGateway();
+    const live = await Harness.start({ config: CONFIG, clock, paymentGateway: gateway });
+    try {
+      const userId = await live.createUser();
+      const bundleId = await live.giveBundle(userId, {
+        tier: 'BASIC',
+        startDate: BASE,
+        endDate: PERIOD_END,
+      });
+      clock.travelTo(AFTER_PERIOD);
+
+      gateway.duringCharge = async () => {
+        await live.container.database.query(
+          `UPDATE subscription_bundles
+              SET status = 'CANCELLED', cancelled_at = $2, auto_renew = FALSE
+            WHERE id = $1`,
+          [bundleId, AFTER_PERIOD],
+        );
+      };
+
+      const report = await live.container.billing.run();
+
+      expect(gateway.charges).toHaveLength(1);
+      expect(report.needsReconciliation).toContain(bundleId);
+      expect(report.renewed).toHaveLength(0);
+
+      const [, settled] = await live.container.database.query<{
+        status: string;
+        payment_reference: string | null;
+      }>(
+        `SELECT status, payment_reference FROM subscription_billing_periods
+          WHERE bundle_id = $1 ORDER BY period_start`,
+        [bundleId],
+      );
+      // The charge is on the record, not silently lost.
+      expect(settled?.status).toBe('PAID');
+      expect(settled?.payment_reference).toBeTruthy();
+    } finally {
+      await live.stop();
+    }
+  });
+
+  it('never advances through a period it did not claim and charge', async () => {
+    // Two cycles overdue - the scheduler was down. One runner reads the
+    // subscription and is then overtaken: by the time it acts, another runner
+    // has already claimed, charged and rolled that period. Reading the settled
+    // outcome and advancing again would move the subscription through a period
+    // with no billing row and no charge, so the guard checks that the
+    // subscription is still on the boundary this run claimed, not merely that
+    // it is overdue.
+    const gw = new RecordingGateway();
+    const live = await Harness.start({ config: CONFIG, clock, paymentGateway: gw });
+    try {
+      const userId = await live.createUser();
+      const bundleId = await live.giveBundle(userId, {
+        tier: 'BASIC',
+        startDate: new Date('2026-05-19T10:00:00Z'),
+        endDate: new Date('2026-06-19T10:00:00Z'),
+      });
+      clock.travelTo(BASE);
+
+      const fresh = new PostgresSubscriptionRepository(live.container.database);
+      const periods = new PostgresBillingPeriodRepository(live.container.database);
+      let overtaken!: () => void;
+      const held = new Promise<void>((resolve) => {
+        overtaken = resolve;
+      });
+
+      // Identical to the real repository, except that it hands back a snapshot
+      // and then waits, so the other runner can finish first.
+      const stale: SubscriptionRepository = {
+        insert: (uow, bundle) => fresh.insert(uow, bundle),
+        update: (uow, bundle) => fresh.update(uow, bundle),
+        lockById: (uow, id) => fresh.lockById(uow, id),
+        findForUser: (id, user) => fresh.findForUser(id, user),
+        listByUser: (user) => fresh.listByUser(user),
+        findAwaitingPayment: (before, limit) => fresh.findAwaitingPayment(before, limit),
+        findDue: async (at, limit) => {
+          const rows = await fresh.findDue(at, limit);
+          await held;
+          return rows;
+        },
+      };
+
+      const overtakenRun = new BillingService(
+        live.container.database,
+        stale,
+        periods,
+        gw,
+        clock,
+        60_000,
+      ).run();
+
+      await live.container.billing.run();
+      overtaken();
+      await overtakenRun;
+
+      // Exactly one period was claimed and charged, and the subscription sits on
+      // the end of that period - not a cycle beyond it.
+      expect(gw.charges).toHaveLength(1);
+      expect(await live.billingPeriods(bundleId)).toHaveLength(2);
+      expect((await live.bundle(bundleId)).end_date.toISOString()).toBe('2026-07-19T10:00:00.000Z');
     } finally {
       await live.stop();
     }

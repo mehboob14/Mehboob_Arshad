@@ -76,13 +76,15 @@ export class PostgresBillingPeriodRepository implements BillingPeriodRepository 
     outcome:
       { status: 'PAID'; paymentReference: string } | { status: 'FAILED'; declineReason: string },
     at: Date,
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Only a PENDING claim can be settled, so a duplicate settlement is a no-op
-    // rather than an overwrite of the recorded outcome.
-    await uow.query(
+    // rather than an overwrite of the recorded outcome. The row count tells the
+    // caller which of the two happened.
+    const rows = await uow.query<{ id: string }>(
       `UPDATE subscription_billing_periods
           SET status = $3, payment_reference = $4, decline_reason = $5, settled_at = $6
-        WHERE bundle_id = $1 AND period_start = $2 AND status = 'PENDING'`,
+        WHERE bundle_id = $1 AND period_start = $2 AND status = 'PENDING'
+        RETURNING id`,
       [
         bundleId,
         periodStart,
@@ -92,6 +94,7 @@ export class PostgresBillingPeriodRepository implements BillingPeriodRepository 
         at,
       ],
     );
+    return rows.length === 1;
   }
 
   async recordUsage(

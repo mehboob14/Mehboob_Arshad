@@ -139,4 +139,25 @@ describe('message quota', () => {
     expect(usage.body['free']).toMatchObject({ granted: 3, used: 1, remaining: 2 });
     expect(usage.body['totalRemaining']).toBe(12);
   });
+
+  it('rejects an unreadable body as a client error, not a server fault', async () => {
+    const userId = await harness.createUser();
+
+    // Truncated JSON, and a body over the 256kb limit. Both used to surface as
+    // 500 INTERNAL_ERROR: the size guard was invisible to clients, a client bug
+    // was indistinguishable from an outage, and any caller could drive the 5xx
+    // rate and fill the log with stack traces using malformed input alone.
+    const truncated = await harness.postRaw('/api/v1/chat/messages', userId, '{"question": "hi"');
+    const oversized = await harness.postRaw(
+      '/api/v1/chat/messages',
+      userId,
+      JSON.stringify({ question: 'x'.repeat(300_000) }),
+    );
+
+    expect(truncated.status).toBe(400);
+    expect(oversized.status).toBe(413);
+    for (const response of [truncated, oversized]) {
+      expect((response.body['error'] as { code: string }).code).toBe('VALIDATION_FAILED');
+    }
+  });
 });

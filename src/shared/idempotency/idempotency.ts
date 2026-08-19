@@ -4,7 +4,15 @@ import { DomainError } from '../domain/errors.js';
 export type SettledStatus = 'COMPLETED' | 'FAILED';
 
 export type ClaimResult =
-  | { outcome: 'CLAIMED' }
+  /**
+   * `claimedAt` is a fencing token. A claim can change hands when its owner
+   * stalls past the timeout, and a stalled owner is not necessarily a dead one:
+   * it can come back and try to settle or release a claim that is no longer
+   * its own. Carrying the instant it took ownership lets every later write say
+   * "only if I am still the owner", so a superseded request updates nothing
+   * instead of overwriting the new owner's response or deleting a live claim.
+   */
+  | { outcome: 'CLAIMED'; claimedAt: Date }
   | { outcome: 'REPLAY'; status: number; body: unknown }
   | { outcome: 'IN_PROGRESS' }
   | { outcome: 'FINGERPRINT_MISMATCH' };
@@ -13,12 +21,15 @@ export interface ClaimRequest {
   userId: string;
   key: string;
   fingerprint: string;
+  /** Stamped onto the claim, and compared against on every later write. */
+  at: Date;
   staleClaimsBefore: Date;
 }
 
 export interface SettleRequest {
   userId: string;
   key: string;
+  claimedAt: Date;
   status: SettledStatus;
   responseStatus: number;
   responseBody: unknown;
@@ -27,7 +38,7 @@ export interface SettleRequest {
 export interface IdempotencyStore {
   claim(request: ClaimRequest): Promise<ClaimResult>;
   settle(request: SettleRequest): Promise<void>;
-  release(userId: string, key: string): Promise<void>;
+  release(userId: string, key: string, claimedAt: Date): Promise<void>;
 }
 
 export class IdempotencyKeyReusedError extends DomainError {

@@ -127,6 +127,41 @@ describe('idempotent message submission', () => {
       await flaky.stop();
     }
   });
+
+  it('stops a superseded claimant from clobbering or deleting the new claim', async () => {
+    // A claim changes hands when its owner stalls past the timeout - and a
+    // stalled owner is not always a dead one. If it comes back it must not be
+    // able to overwrite the new owner's recorded response, nor delete a live
+    // claim and let a third attempt run the work again.
+    const store = harness.container.idempotency.store;
+    const userId = await harness.createUser();
+    const first = new Date('2026-08-19T10:00:00.000Z');
+    const second = new Date('2026-08-19T10:05:00.000Z');
+    const claim = (at: Date) => ({
+      userId,
+      key: 'contested',
+      fingerprint: 'same',
+      at,
+      staleClaimsBefore: new Date(at.getTime() - 60_000),
+    });
+
+    expect((await store.claim(claim(first))).outcome).toBe('CLAIMED');
+    expect((await store.claim(claim(second))).outcome).toBe('CLAIMED');
+
+    // The original owner returns, holding a token that is no longer current.
+    await store.settle({
+      userId,
+      key: 'contested',
+      claimedAt: first,
+      status: 'COMPLETED',
+      responseStatus: 201,
+      responseBody: { from: 'the superseded owner' },
+    });
+    await store.release(userId, 'contested', first);
+
+    // Neither write landed: the claim is still held, and still in progress.
+    expect((await store.claim(claim(second))).outcome).toBe('IN_PROGRESS');
+  });
 });
 
 function currentPeriod(): string {

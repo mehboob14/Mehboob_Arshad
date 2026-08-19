@@ -297,14 +297,34 @@ one `201` — on both the bundle path and the free path.
 
 ### 2. A retry does not charge twice
 
-The classic implementation — _check the key, do the work, save the key_ — has a window between
-the check and the save in which two requests both pass. So the key is **claimed, not checked**:
+The ordering is the whole design:
+
+```
+check key -> charge -> save key + response     <- both requests pass in the gap
+insert key -> charge -> save response          <- the database picks a winner first
+```
+
+The first is what almost everyone writes, and it is wrong: between reading the key and writing it
+there is a window in which a second request reads the same absence and proceeds. The window is
+small, which is exactly why it survives review and shows up later as duplicate charges.
+
+So the key is **claimed, not checked**:
 
 ```sql
-INSERT INTO idempotency_keys (…, status) VALUES (…, 'PROCESSING')
+INSERT INTO idempotency_keys (user_id, idempotency_key, request_fingerprint, status)
+VALUES ($1, $2, $3, 'PROCESSING')
 ON CONFLICT ON CONSTRAINT idempotency_keys_scope_key DO NOTHING
 RETURNING id
 ```
+
+and the claim is only meaningful because of one line in the schema:
+
+```sql
+CONSTRAINT idempotency_keys_scope_key UNIQUE (user_id, idempotency_key)
+```
+
+`request_fingerprint` is `NOT NULL` for the same reason: a nullable column lets a code path skip
+the check and silently lose duplicate protection for that request.
 
 The `UNIQUE` constraint picks the winner atomically, inside the database, before any work begins.
 `ON CONFLICT DO NOTHING` is used rather than catching SQLSTATE `23505` because a raised error
@@ -445,34 +465,40 @@ month arithmetic gets both wrong, and shifts every subsequent renewal date with 
 
 Handled deliberately, each with a test.
 
-| Edge case                                           | Handling                                                                                      |
-| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Two requests race for the last credit               | Row locks in a fixed order, conditional write, `CHECK` constraint                             |
-| Two requests race for the last _free_ message       | Same path — the free grant is locked exactly like a bundle                                    |
-| Crossed lock ordering between concurrent requests   | Locks always acquired free-row-first, then bundles by primary key                             |
-| Client retries a slow request                       | `Idempotency-Key` claimed before work begins; replay returns the recorded response            |
-| Duplicate arrives while the original is in flight   | `409 REQUEST_IN_PROGRESS` — never a second attempt                                            |
-| Same key, different body                            | `422` — key reuse is a client bug, not a retry                                                |
-| Two tenants pick the same key string                | Keys scoped `UNIQUE (user_id, key)`; the fingerprint includes the user                        |
-| Client reorders JSON fields on retry                | Fingerprint canonicalises key order at every depth                                            |
-| Process dies holding an idempotency claim           | Stale claims taken over by conditional `UPDATE` after a timeout                               |
-| AI provider fails after quota was deducted          | Compensating transaction: message `FAILED`, charge reversed, key released for a genuine retry |
-| Quota exhausted mid-retry                           | The refusal is _recorded_, so a replay sees the same `402`, not a new evaluation              |
-| Enterprise "unlimited" in a most-remaining ordering | Unlimited is `NULL` and sorts last by policy, so perishable credit is spent first             |
-| Bundle expires between purchase and use             | `isServingAt` gates on the `[startDate, endDate)` window, not just status                     |
-| Bundle cancelled but still inside the paid period   | Stays `ACTIVE` and keeps serving; only renewal stops                                          |
-| Cancel called twice                                 | `409 INVALID_SUBSCRIPTION_STATE`                                                              |
-| Auto-renew re-enabled after cancellation            | Refused in the domain _and_ by a DB constraint                                                |
-| First charge declined                               | Bundle recorded as `PAYMENT_FAILED`, serves nothing, remains auditable                        |
-| Gateway times out — outcome unknown                 | Claim held, reported for reconciliation, never auto-retried                                   |
-| Two billing runs execute concurrently               | `UNIQUE (bundle_id, period_start)` admits one; the other replays or defers                    |
-| Billing run crashes half way                        | Re-run replays settled periods and finishes advancing the subscription                        |
-| Renewal resets the counter                          | Closing usage snapshotted into the billing period first, so history survives                  |
-| Subscription started on the 31st                    | Anniversary clamped to the last valid day; no drift                                           |
-| Leap day renewal                                    | 29 Feb renews 28 Feb the following year                                                       |
-| Month boundary in a non-UTC local time              | All period keys computed in UTC                                                               |
-| Another user's subscription id                      | `404`, not `403` — existence is not disclosed                                                 |
-| Free grant configured to zero                       | Supported; the policy falls straight through to bundles                                       |
+| Edge case                                                  | Handling                                                                                      |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Two requests race for the last credit                      | Row locks in a fixed order, conditional write, `CHECK` constraint                             |
+| Two requests race for the last _free_ message              | Same path — the free grant is locked exactly like a bundle                                    |
+| Crossed lock ordering between concurrent requests          | Locks always acquired free-row-first, then bundles by primary key                             |
+| Client retries a slow request                              | `Idempotency-Key` claimed before work begins; replay returns the recorded response            |
+| Duplicate arrives while the original is in flight          | `409 REQUEST_IN_PROGRESS` — never a second attempt                                            |
+| Same key, different body                                   | `422` — key reuse is a client bug, not a retry                                                |
+| Two tenants pick the same key string                       | Keys scoped `UNIQUE (user_id, key)`; the fingerprint includes the user                        |
+| Client reorders JSON fields on retry                       | Fingerprint canonicalises key order at every depth                                            |
+| Process dies holding an idempotency claim                  | Stale claims taken over by conditional `UPDATE` after a timeout                               |
+| AI provider fails after quota was deducted                 | Compensating transaction: message `FAILED`, charge reversed, key released for a genuine retry |
+| Quota exhausted mid-retry                                  | The refusal is _recorded_, so a replay sees the same `402`, not a new evaluation              |
+| Enterprise "unlimited" in a most-remaining ordering        | Unlimited is `NULL` and sorts last by policy, so perishable credit is spent first             |
+| Bundle expires between purchase and use                    | `isServingAt` gates on the `[startDate, endDate)` window, not just status                     |
+| Bundle cancelled but still inside the paid period          | Stays `ACTIVE` and keeps serving; only renewal stops                                          |
+| Cancel called twice                                        | `409 INVALID_SUBSCRIPTION_STATE`                                                              |
+| Auto-renew re-enabled after cancellation                   | Refused in the domain _and_ by a DB constraint                                                |
+| First charge declined                                      | Bundle recorded as `PAYMENT_FAILED`, serves nothing, remains auditable                        |
+| Gateway times out — outcome unknown                        | Claim held, reported for reconciliation, never auto-retried                                   |
+| Two billing runs execute concurrently                      | `UNIQUE (bundle_id, period_start)` admits one; the other replays or defers                    |
+| Billing run crashes half way                               | Re-run replays settled periods and finishes advancing the subscription                        |
+| Renewal resets the counter                                 | Closing usage snapshotted into the billing period first, so history survives                  |
+| Subscription started on the 31st                           | Anniversary clamped to the last valid day; no drift                                           |
+| Leap day renewal                                           | 29 Feb renews 28 Feb the following year                                                       |
+| Month boundary in a non-UTC local time                     | All period keys computed in UTC                                                               |
+| Another user's subscription id                             | `404`, not `403` — existence is not disclosed                                                 |
+| Free grant configured to zero                              | Supported; the policy falls straight through to bundles                                       |
+| Timestamp written by the database, not the app clock       | Every timestamp column is `timestamptz(3)`, so the value survives a JS `Date` round trip      |
+| Bookkeeping write fails after the effect committed         | The claim is kept rather than released: a retry gets `409`, never a second charge             |
+| Claim taken over while its owner is stalled but alive      | `claimed_at` is a fencing token; a superseded owner's writes match no row                     |
+| Runner overtaken between reading a subscription and acting | The renewal guard requires the subscription still be on the boundary it claimed               |
+| Charge lands for a period the subscription has since left  | Recorded `PAID` and surfaced under `needsReconciliation` for a human                          |
+| Body is not valid JSON, or over the size limit             | `400` / `413` with `VALIDATION_FAILED`, never a `500`                                         |
 
 ---
 
@@ -595,24 +621,29 @@ Unit tests are pure: policy, state machine and date arithmetic, no database. Int
 against real PostgreSQL over real HTTP, because a concurrency guarantee that is only proven against
 a mock is not proven.
 
-| Test                                            | What breaks if it fails                              |
-| ----------------------------------------------- | ---------------------------------------------------- |
-| 8 concurrent requests, 1 credit                 | Users consume more than they paid for                |
-| 8 concurrent requests, 1 free message           | Same, on the free path                               |
-| Duplicate `Idempotency-Key`                     | Users are charged twice for one retry                |
-| Simultaneous duplicate keys                     | The double-click case, in flight                     |
-| Same key, different body                        | Silent key reuse corrupts the record                 |
-| Keys reused across two users                    | One tenant can observe or block another              |
-| AI provider failure                             | Users pay for answers they never got                 |
-| Month rollover with a fixed clock               | The free grant never resets, or resets wrongly       |
-| Bundle selection order                          | The wrong balance is drained; credit expires unused  |
-| Unlimited held in reserve                       | Perishable prepaid credit is wasted                  |
-| Repeated billing run                            | Subscribers are charged twice for one period         |
-| Concurrent billing runs                         | Same, under a race                                   |
-| Declined renewal                                | An unpaid subscription keeps serving                 |
-| Gateway timeout during renewal                  | An unknown charge is retried and duplicated          |
-| Cancel, then run billing past `endDate`         | Cancellation deletes history, or service stops early |
-| Duplicate purchase key                          | A user is billed twice for one bundle                |
-| Another user's subscription id                  | Cross-tenant data exposure                           |
-| Month-end and leap-day renewal dates            | Every subsequent renewal date drifts                 |
-| Period closed by a database-generated timestamp | Usage history is silently lost on renewal            |
+| Test                                            | What breaks if it fails                                           |
+| ----------------------------------------------- | ----------------------------------------------------------------- |
+| 8 concurrent requests, 1 credit                 | Users consume more than they paid for                             |
+| 8 concurrent requests, 1 free message           | Same, on the free path                                            |
+| Duplicate `Idempotency-Key`                     | Users are charged twice for one retry                             |
+| Simultaneous duplicate keys                     | The double-click case, in flight                                  |
+| Same key, different body                        | Silent key reuse corrupts the record                              |
+| Keys reused across two users                    | One tenant can observe or block another                           |
+| AI provider failure                             | Users pay for answers they never got                              |
+| Month rollover with a fixed clock               | The free grant never resets, or resets wrongly                    |
+| Bundle selection order                          | The wrong balance is drained; credit expires unused               |
+| Unlimited held in reserve                       | Perishable prepaid credit is wasted                               |
+| Repeated billing run                            | Subscribers are charged twice for one period                      |
+| Concurrent billing runs                         | Same, under a race                                                |
+| Declined renewal                                | An unpaid subscription keeps serving                              |
+| Gateway timeout during renewal                  | An unknown charge is retried and duplicated                       |
+| Cancel, then run billing past `endDate`         | Cancellation deletes history, or service stops early              |
+| Duplicate purchase key                          | A user is billed twice for one bundle                             |
+| Another user's subscription id                  | Cross-tenant data exposure                                        |
+| Month-end and leap-day renewal dates            | Every subsequent renewal date drifts                              |
+| Period closed by a database-generated timestamp | Usage history is silently lost on renewal                         |
+| Settle fails after the effect committed         | A retry re-runs the work and charges a second time                |
+| Superseded claimant settles or releases         | A successor's response is overwritten, or a live claim deleted    |
+| Runner overtaken mid-renewal                    | A period is skipped, with no billing row and no charge            |
+| Charge for a period the subscription left       | Money moves with no record and no report                          |
+| Unreadable or oversized request body            | Client bugs read as server outages; anyone can drive the 5xx rate |

@@ -1,6 +1,7 @@
 import { loadConfig } from '../src/config.js';
 import { tierDefinition } from '../src/modules/subscriptions/domain/tier.js';
 import type { BillingCycle, Tier } from '../src/modules/subscriptions/domain/tier.js';
+import { CalendarMonth } from '../src/shared/domain/calendar-month.js';
 import { migrate } from '../src/shared/persistence/migrate.js';
 import { PostgresDatabase } from '../src/shared/persistence/postgres.js';
 
@@ -101,6 +102,17 @@ await db.withTransaction(async (uow) => {
           definition.priceCents[bundle.billingCycle],
           bundle.usedMessages,
         ],
+      );
+    }
+
+    // A user who holds a bundle starts with the free grant already spent, so the
+    // demo requests in api.http exercise the bundle they were written to show
+    // rather than silently drawing on the free tier for the first three clicks.
+    if (user.bundles.length > 0) {
+      await uow.query(
+        `INSERT INTO free_allowance_periods (user_id, period, granted, used)
+         VALUES ($1, $2, $3, $3)`,
+        [user.id, CalendarMonth.from(now).key, config.FREE_MESSAGES_PER_MONTH],
       );
     }
   }

@@ -96,8 +96,29 @@ export class BillingService {
 
     await this.transactions.withTransaction(async (uow) => {
       const locked = await this.subscriptions.lockById(uow, bundle.id);
-      // Another runner finished this renewal between the claim and here.
-      if (!locked?.isDueAt(at)) return;
+
+      // The subscription must still be sitting on the boundary this run claimed.
+      // Being merely overdue is not enough: a bundle several cycles behind stays
+      // overdue after another runner advances it, and acting on that would move
+      // it through a period nobody claimed or charged. `period.start` is by
+      // construction the endDate of the snapshot this run read, so comparing
+      // them asks "has the bundle moved underneath us", not "is it overdue".
+      if (!locked || !locked.isDueAt(at) || locked.endDate.getTime() !== period.start.getTime()) {
+        // The charge is a fact whether or not the subscription still wants it,
+        // so it is recorded either way. settle only matches a period still
+        // PENDING, so a benign replay updates nothing and reports nothing;
+        // reaching a row here means this run charged for a period the
+        // subscription has since left, which a human has to resolve.
+        const settled = await this.periods.settle(
+          uow,
+          bundle.id,
+          period.start,
+          toSettlement(payment),
+          at,
+        );
+        if (settled) report.needsReconciliation.push(bundle.id);
+        return;
+      }
 
       await this.periods.settle(uow, bundle.id, period.start, toSettlement(payment), at);
       await this.periods.recordUsage(uow, bundle.id, locked.endDate, locked.usedMessages);

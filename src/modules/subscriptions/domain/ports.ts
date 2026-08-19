@@ -64,6 +64,7 @@ export interface BillingPeriodRepository {
    */
   open(uow: UnitOfWork, period: NewBillingPeriod): Promise<boolean>;
   find(uow: UnitOfWork, bundleId: string, periodStart: Date): Promise<BillingPeriod | null>;
+  /** Settles a claimed period. False when it was already settled by someone else. */
   settle(
     uow: UnitOfWork,
     bundleId: string,
@@ -71,7 +72,7 @@ export interface BillingPeriodRepository {
     outcome:
       { status: 'PAID'; paymentReference: string } | { status: 'FAILED'; declineReason: string },
     at: Date,
-  ): Promise<void>;
+  ): Promise<boolean>;
   /** Snapshots a period's closing usage before the bundle's counter is reset. */
   recordUsage(
     uow: UnitOfWork,
