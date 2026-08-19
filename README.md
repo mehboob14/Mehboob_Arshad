@@ -3,8 +3,11 @@
 A metered AI chat API funded by subscription bundles.
 TypeScript · Express 5 · PostgreSQL · Clean Architecture (DDD-style)
 
-**Status:** both modules complete. 62 tests passing (32 unit, 30 integration). Lint and
+**Status:** both modules complete. 70 tests passing (36 unit, 34 integration). Lint and
 `tsc --noEmit` clean. Verified end to end against PostgreSQL 17.
+
+Six defects found by an adversarial review before submission are fixed, each with a regression
+test confirmed to fail against the previous code — see [How this was verified](#how-this-was-verified).
 
 ---
 
@@ -17,6 +20,7 @@ TypeScript · Express 5 · PostgreSQL · Clean Architecture (DDD-style)
 - [API](#api)
 - [Architecture](#architecture)
 - [Engineering decisions](#engineering-decisions)
+- [How this was verified](#how-this-was-verified)
 - [Edge cases](#edge-cases)
 - [Assumptions, and why](#assumptions-and-why)
 - [Known limitations](#known-limitations)
@@ -44,7 +48,7 @@ docker compose up -d
 ```
 
 ```bash
-npm test          # 62 tests (integration needs the database)
+npm test          # 70 tests (integration needs the database)
 npm run lint
 npm run typecheck
 ```
@@ -62,7 +66,9 @@ Seeded users, with fixed ids so every request below can be copied and run as-is:
 
 ## Verifying this in five minutes
 
-`api.http` has a runnable request for every behaviour described here. The three worth running
+`api.http` has a runnable request for every behaviour described here. Users who hold a bundle are
+seeded with the free grant already spent, so those requests exercise the bundle they were written
+to demonstrate rather than quietly drawing on the free tier for the first three clicks. The three worth running
 first, because they are the three that are hard to get right:
 
 **1. The free grant, then a structured refusal.** Send the same request four times as the
@@ -204,16 +210,16 @@ Authentication is out of scope, so the caller asserts identity with an `X-User-I
 Every failure returns one envelope — `{ "error": { code, message, details } }` — with a
 machine-readable code and enough context to recover without a second round trip.
 
-| Code                          | Status | Meaning                                                          |
-| ----------------------------- | ------ | ---------------------------------------------------------------- |
-| `QUOTA_EXCEEDED`              | 402    | No allowance can pay for the message. Not throttling — unfunded. |
-| `PAYMENT_DECLINED`            | 402    | The gateway said no. The bundle is recorded as `PAYMENT_FAILED`. |
-| `REQUEST_IN_PROGRESS`         | 409    | A request with this idempotency key is still running.            |
-| `INVALID_SUBSCRIPTION_STATE`  | 409    | The transition is not legal from the current state.              |
-| `IDEMPOTENCY_KEY_REUSED`      | 422    | Same key, different body.                                        |
-| `VALIDATION_FAILED`           | 422    | Payload rejected at the boundary.                                |
-| `PAYMENT_GATEWAY_UNAVAILABLE` | 502    | Charge outcome unknown. Never retried automatically.             |
-| `AI_PROVIDER_UNAVAILABLE`     | 503    | Provider failed; the charge has been reversed.                   |
+| Code                          | Status        | Meaning                                                          |
+| ----------------------------- | ------------- | ---------------------------------------------------------------- |
+| `QUOTA_EXCEEDED`              | 402           | No allowance can pay for the message. Not throttling — unfunded. |
+| `PAYMENT_DECLINED`            | 402           | The gateway said no. The bundle is recorded as `PAYMENT_FAILED`. |
+| `REQUEST_IN_PROGRESS`         | 409           | A request with this idempotency key is still running.            |
+| `INVALID_SUBSCRIPTION_STATE`  | 409           | The transition is not legal from the current state.              |
+| `IDEMPOTENCY_KEY_REUSED`      | 422           | Same key, different body.                                        |
+| `VALIDATION_FAILED`           | 400, 413, 422 | Body unreadable, over the size limit, or failing validation.     |
+| `PAYMENT_GATEWAY_UNAVAILABLE` | 502           | Charge outcome unknown. Never retried automatically.             |
+| `AI_PROVIDER_UNAVAILABLE`     | 503           | Provider failed; the charge has been reversed.                   |
 
 `402` rather than `429` for an exhausted quota is deliberate: the request is not being throttled,
 it is unfunded. Retrying later without buying anything will not help, and the status code should
@@ -354,6 +360,17 @@ Two details that only matter in production:
   claim is released so the same key may genuinely be retried. `DomainError.retryable` draws that
   line explicitly, rather than the idempotency layer guessing from a status code.
 
+- **Ownership is proved on every write.** A claim can change hands when its owner stalls past the
+  timeout, and a stalled owner is not necessarily a dead one. Each claimant carries the instant it
+  took ownership, and every later write is conditional on it, so a superseded request updates
+  nothing rather than overwriting its successor's response or deleting a live claim.
+- **Recording the outcome is not part of the work.** The write that records success happens
+  _outside_ the try: the effect has already committed, so a failed bookkeeping write must not be
+  mistaken for failed work. Treating it as one would release the claim and let a retry run
+  everything a second time — and a retried purchase mints a new subscription id, so neither the
+  billing-period constraint nor the gateway reference would deduplicate it. Leaving the claim in
+  place makes that retry a `409`, which is recoverable; a duplicate charge is not.
+
 Keys are scoped `UNIQUE (user_id, idempotency_key)` rather than globally, so one tenant can
 neither collide with nor probe another's keys. The same decorator protects both money paths:
 sending a message, and buying a bundle.
@@ -402,6 +419,13 @@ The three outcomes are each handled deliberately:
   under `needsReconciliation`. It is **never** retried automatically, because retrying a charge
   whose outcome is unknown is exactly how customers get billed twice. The same rule governs the
   HTTP path: `PAYMENT_GATEWAY_UNAVAILABLE` is deliberately marked non-retryable.
+
+A renewal advances the subscription only if it is still sitting on the boundary this run claimed.
+Being merely overdue is not enough: a subscription several cycles behind stays overdue after
+another runner advances it, and acting on that would move it through a period nobody claimed or
+charged. When the subscription has moved on, the charge is still recorded and surfaced under
+`needsReconciliation` — money that moved must never be invisible, which is the entire point of
+claiming before charging.
 
 A run that crashes half way is safe to re-run: a period already settled replays its recorded
 outcome and finishes advancing the subscription instead of charging again. Each subscription is
@@ -458,6 +482,70 @@ lookup, no HTTP. `addBillingCycle(from, cycle)` is the same. Both are exhaustive
 including the cases that only bite in production: a subscription started on the 31st renews on the
 28th rather than sliding into March, and a leap day renews on the 28th the following year. Naive
 month arithmetic gets both wrong, and shifts every subsequent renewal date with it.
+
+---
+
+## How this was verified
+
+The test suite is the floor, not the ceiling. Before submitting, this codebase went through a
+structured adversarial review: independent passes over concurrency, idempotency, domain
+correctness against the brief, security and multi-tenancy, and whether this document tells the
+truth — with every finding handed to a separate pass whose only job was to **refute** it. Ten
+defects were raised. Six survived. Four did not, and those four matter as much as the six.
+
+### What survived, and why each mattered
+
+| Defect                                                                                                     | Consequence                                                                                                                                                                                                                                 | Resolution                                                                                 |
+| ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| A renewal charge whose subscription was closed under it returned early without settling the claimed period | The row stayed `PENDING` with no reference, unreachable by `findDue` and `findAwaitingPayment` alike, and absent from every report — the one outcome claim-then-charge exists to surface                                                    | The outcome is recorded regardless; the run reports it when it is the one that recorded it |
+| A renewal advanced on "is this overdue" rather than "is this still on the boundary I claimed"              | A subscription several cycles behind stays overdue after another runner advances it, so an overtaken runner could move it through a period nobody claimed or charged — a free month, and a hole in the usage history                        | The guard compares the locked `endDate` against the period this run claimed                |
+| The write recording success sat inside the `try`                                                           | Losing it looked like failed work and released the claim **after** the effect had committed. A retried purchase mints a new subscription id, so neither the period constraint nor the gateway reference could deduplicate the second charge | The write moved outside the `try`; its failure is absorbed, and the retry gets `409`       |
+| A claim taken over on timeout had no fencing token                                                         | The previous owner — stalled, not dead — could return and overwrite its successor's recorded response, or delete a live claim so a third attempt ran the work again                                                                         | `claimed_at` is stamped from the injected clock and asserted on every later write          |
+| An unreadable or oversized body fell through to `500`                                                      | The size limit was invisible to clients, a client bug was indistinguishable from an outage, and any caller could drive the 5xx rate and fill the log with stack traces                                                                      | Errors carrying a 4xx status are mapped to it                                              |
+| Seeded bundle holders still had their free grant                                                           | The `api.http` request labelled as the bundle-selection demo charged the free tier instead, appearing to contradict the rule it was written to show                                                                                         | The seed spends the grant for users who hold a bundle                                      |
+
+The first two are the interesting pair: both are the _same_ mistake in different clothes — trusting
+a snapshot that another actor may have invalidated while a network call was in flight. That is the
+cost of the deliberate choice not to hold a lock across the gateway, and it is worth paying, but it
+has to be paid explicitly rather than assumed away.
+
+### What was refuted, and why that matters more
+
+One reviewer argued the renewal guard should also check `shouldRenewAt`, so that a cancellation
+racing the gateway call is not charged. The refutation showed the money is **already gone** by the
+time that line runs: the proposed guard could not prevent the charge, only prevent it being
+recorded. It would have converted a visible problem into a silent one — strictly worse than the
+bug it was aimed at.
+
+Another argued a cancel racing a renewal leaves the subscription in a corrupt state. Running both
+orderings through the real aggregate produced byte-identical snapshots, so there was nothing to
+fix. A third challenged a claim in this document that a database `CHECK` constraint already
+guarantees.
+
+Adversarial verification is not ceremony. Two of those four "fixes" would have made the system
+worse, and a review that only collects findings has no way to tell them apart.
+
+### Every fix fails without its fix
+
+A test that passes for the wrong reason is worse than no test, so each regression was checked by
+reverting `src/` and re-running the suite:
+
+```
+× reports a charge for a period the subscription has since left
+× never advances through a period it did not claim and charge
+× stops a superseded claimant from clobbering or deleting the new claim
+× rejects an unreadable body as a client error, not a server fault
+× does not release the claim when recording the outcome fails
+× proves ownership on every write, so a superseded claimant cannot clobber
+
+Tests  6 failed | 64 passed (70)
+```
+
+That check earned its keep immediately. The first version of _never advances through a period it
+did not claim_ **passed against the broken code** — three concurrent billing runs simply never hit
+the interleave, so it asserted nothing. It was rewritten around a repository that hands back a
+snapshot and then blocks, letting the other runner finish first, so the race is deterministic
+rather than hoped for.
 
 ---
 
@@ -614,12 +702,13 @@ exactly where each one would attach.
 
 ## Tests
 
-62 tests: 32 unit, 30 integration. Not coverage for its own sake — one test per rule the brief
+70 tests: 36 unit, 34 integration. Not coverage for its own sake — one test per rule the brief
 states, plus the races that break metering and billing systems in production.
 
 Unit tests are pure: policy, state machine and date arithmetic, no database. Integration tests run
 against real PostgreSQL over real HTTP, because a concurrency guarantee that is only proven against
-a mock is not proven.
+a mock is not proven. Races are forced deterministically rather than left to chance — a test that
+only sometimes exercises the interleave it names is a test that only sometimes exists.
 
 | Test                                            | What breaks if it fails                                           |
 | ----------------------------------------------- | ----------------------------------------------------------------- |
