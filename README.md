@@ -3,11 +3,7 @@
 A metered AI chat API funded by subscription bundles.
 TypeScript · Express 5 · PostgreSQL · Clean Architecture (DDD-style)
 
-**Status:** both modules complete. 70 tests passing (36 unit, 34 integration). Lint and
-`tsc --noEmit` clean. Verified end to end against PostgreSQL 17.
-
-Six defects found by an adversarial review before submission are fixed, each with a regression
-test confirmed to fail against the previous code — see [How this was verified](#how-this-was-verified).
+**Status:** both modules complete.
 
 ---
 
